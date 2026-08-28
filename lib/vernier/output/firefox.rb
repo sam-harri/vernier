@@ -215,8 +215,7 @@ module Vernier
               {
                 label: "Description",
                 value: "The thread has acquired the GVL and is executing"
-              },
-              { key: "cpu_time", label: "CPU time", format: "microseconds" }
+              }
             ]
           },
           {

@@ -61,7 +61,7 @@ static VALUE rb_mVernierMarkerType;
 static VALUE rb_cVernierCollector;
 static VALUE rb_cTimeCollector;
 
-static VALUE sym_state, sym_gc_by, sym_fiber_id, sym_cpu_time;
+static VALUE sym_state, sym_gc_by, sym_fiber_id;
 
 static const char *gvl_event_name(rb_event_flag_t event) {
     switch (event) {
@@ -164,10 +164,10 @@ static native_thread_id_t get_native_thread_id() {
 #endif
 }
 
+#if defined(__APPLE__)
 // Returns cumulative CPU nanoseconds for a thread, or 0 if unavailable.
 static uint64_t get_thread_cpu_time_ns(pthread_t pthread_id) {
     if (!pthread_id) return 0;
-#if defined(__APPLE__)
     mach_port_t mach_thread = pthread_mach_thread_np(pthread_id);
     if (!mach_thread) return 0;
     thread_basic_info_data_t info;
@@ -179,14 +179,15 @@ static uint64_t get_thread_cpu_time_ns(pthread_t pthread_id) {
                 + (uint64_t)info.system_time.seconds * 1000000000ULL
                 + (uint64_t)info.system_time.microseconds * 1000ULL;
     return ns;
+}
 #else
-    clockid_t clockid;
-    if (pthread_getcpuclockid(pthread_id, &clockid) != 0) return 0;
+// Returns cumulative CPU nanoseconds for a thread clock, or 0 if unavailable.
+static uint64_t get_thread_cpu_time_ns(clockid_t clockid) {
     struct timespec ts;
     if (clock_gettime(clockid, &ts) != 0) return 0;
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-#endif
 }
+#endif
 
 union MarkerInfo {
     struct {
@@ -196,9 +197,6 @@ union MarkerInfo {
     struct {
         VALUE fiber_id;
     } fiber_data;
-    struct {
-        uint64_t cpu_time_ns;
-    } thread_running_data;
 };
 
 #define EACH_MARKER(XX) \
@@ -271,11 +269,6 @@ class Marker {
             record[5] = hash;
 
             rb_hash_aset(hash, sym_fiber_id, extra_info.fiber_data.fiber_id);
-        } else if (type == Marker::MARKER_THREAD_RUNNING && extra_info.thread_running_data.cpu_time_ns) {
-            VALUE hash = rb_hash_new();
-            record[5] = hash;
-
-            rb_hash_aset(hash, sym_cpu_time, ULL2NUM(extra_info.thread_running_data.cpu_time_ns / 1000));
         }
         return rb_ary_new_from_values(6, record);
     }
@@ -286,10 +279,10 @@ class MarkerTable {
         std::mutex mutex;
         std::vector<Marker> list;
 
-        void record_interval(Marker::Type type, TimeStamp from, TimeStamp to, int stack_index = -1, MarkerInfo extra_info = {}) {
+        void record_interval(Marker::Type type, TimeStamp from, TimeStamp to, int stack_index = -1) {
             const std::lock_guard<std::mutex> lock(mutex);
 
-            list.push_back({ type, Marker::INTERVAL, from, to, stack_index, extra_info });
+            list.push_back({ type, Marker::INTERVAL, from, to, stack_index });
         }
 
         void record(Marker::Type type, int stack_index = -1, MarkerInfo extra_info = {}) {
@@ -410,23 +403,24 @@ class SampleList {
             return size() == 0;
         }
 
-        void record_sample(int stack_index, TimeStamp time, Category category, uint64_t delta_ns = 0) {
+        void record_sample(int stack_index, TimeStamp time, Category category, bool record_cpu_time = false, uint64_t delta_ns = 0) {
           // FIXME: probably better to avoid generating -1 higher up.
           // Currently this happens when we measure an empty stack. Ideally we would have a better representation
           if (stack_index < 0)
             return;
 
-          if (!empty() && stacks.back() == stack_index &&
+          // CPU deltas describe the interval between adjacent timestamps, so
+          // preserve every sample when recording them.
+          if (!record_cpu_time && !empty() && stacks.back() == stack_index &&
               categories.back() == category) {
             // We don't compare timestamps for de-duplication
             weights.back() += 1;
-            cpu_delta_ns.back() += delta_ns;
             } else {
                 stacks.push_back(stack_index);
                 timestamps.push_back(time);
                 categories.push_back(category);
                 weights.push_back(1);
-                cpu_delta_ns.push_back(delta_ns);
+                if (record_cpu_time) cpu_delta_ns.push_back(delta_ns);
             }
         }
 
@@ -492,8 +486,11 @@ class Thread {
         int stack_on_suspend_idx;
         SampleTranslator translator;
 
-        uint64_t last_cpu_ns = 0;             // baseline for per-sample deltas
-        uint64_t running_entry_cpu_ns = 0;    // baseline for RUNNING-interval deltas
+        uint64_t last_cpu_ns = 0;
+#if !defined(__APPLE__)
+        clockid_t cpu_clock_id;
+        bool cpu_clock_initialized = false;
+#endif
 
         unique_ptr<MarkerTable> markers;
 
@@ -530,16 +527,6 @@ class Thread {
             markers->record(Marker::Type::MARKER_FIBER_SWITCH, stack_idx, { .fiber_data = { .fiber_id = fiber_id } });
         }
 
-        MarkerInfo running_cpu_extra_info() const {
-            MarkerInfo info = {};
-            if (state != State::RUNNING || !running_entry_cpu_ns) return info;
-            uint64_t now_cpu = get_thread_cpu_time_ns(pthread_id);
-            if (now_cpu > running_entry_cpu_ns) {
-                info.thread_running_data.cpu_time_ns = now_cpu - running_entry_cpu_ns;
-            }
-            return info;
-        }
-
         void set_state(State new_state, bool current = true) {
             if (state == Thread::State::STOPPED) {
                 return;
@@ -568,12 +555,6 @@ class Thread {
                     pthread_id = pthread_self();
                     native_tid = get_native_thread_id();
 
-                    // Rebase both CPU baselines so per-sample and
-                    // RUNNING-interval deltas ignore time spent while another
-                    // thread held the GVL.
-                    last_cpu_ns = get_thread_cpu_time_ns(pthread_id);
-                    running_entry_cpu_ns = last_cpu_ns;
-
                     // If the GVL is immediately ready, and we measure no times
                     // stalled, skip emitting the interval.
                     if (from != now) {
@@ -593,18 +574,18 @@ class Thread {
                         markers->record_interval(Marker::Type::MARKER_THREAD_SUSPENDED, from, now, stack_on_suspend_idx);
                     }
                     else if (state == State::RUNNING) {
-                        markers->record_interval(Marker::Type::MARKER_THREAD_RUNNING, from, now, -1, running_cpu_extra_info());
+                        markers->record_interval(Marker::Type::MARKER_THREAD_RUNNING, from, now);
                     }
                     break;
                 case State::SUSPENDED:
                     // We can go from RUNNING or STARTED to SUSPENDED
                     assert(state == State::INITIAL || state == State::RUNNING || state == State::STARTED || state == State::SUSPENDED);
-                    markers->record_interval(Marker::Type::MARKER_THREAD_RUNNING, from, now, -1, running_cpu_extra_info());
+                    markers->record_interval(Marker::Type::MARKER_THREAD_RUNNING, from, now);
                     break;
                 case State::STOPPED:
                     // We can go from RUNNING or STARTED or SUSPENDED to STOPPED
                     assert(state == State::INITIAL || state == State::RUNNING || state == State::STARTED || state == State::SUSPENDED);
-                    markers->record_interval(Marker::Type::MARKER_THREAD_RUNNING, from, now, -1, running_cpu_extra_info());
+                    markers->record_interval(Marker::Type::MARKER_THREAD_RUNNING, from, now);
                     markers->record(Marker::Type::MARKER_GVL_THREAD_EXITED);
 
                     stopped_at = now;
@@ -974,6 +955,7 @@ class TimeCollector : public BaseCollector {
                     stack_index,
                     time,
                     category,
+                    record_cpu_time,
                     cpu_delta_ns
                     );
         }
@@ -981,7 +963,15 @@ class TimeCollector : public BaseCollector {
 
     // Advances the CPU baseline and returns delta ns since the previous call.
     uint64_t take_cpu_delta_ns(Thread &thread) {
+#if defined(__APPLE__)
         uint64_t now = get_thread_cpu_time_ns(thread.pthread_id);
+#else
+        if (!thread.cpu_clock_initialized) {
+            if (pthread_getcpuclockid(thread.pthread_id, &thread.cpu_clock_id) != 0) return 0;
+            thread.cpu_clock_initialized = true;
+        }
+        uint64_t now = get_thread_cpu_time_ns(thread.cpu_clock_id);
+#endif
         if (now == 0) return 0;
         uint64_t delta = (thread.last_cpu_ns && now > thread.last_cpu_ns)
                        ? now - thread.last_cpu_ns
@@ -1020,12 +1010,14 @@ class TimeCollector : public BaseCollector {
                 thread.samples.record_sample(
                         thread.stack_on_suspend_idx,
                         sample_start,
-                        CATEGORY_IDLE);
+                        CATEGORY_IDLE,
+                        record_cpu_time);
             } else if (thread.state == Thread::State::READY) {
                 thread.samples.record_sample(
                         thread.stack_on_suspend_idx,
                         sample_start,
-                        CATEGORY_STALLED);
+                        CATEGORY_STALLED,
+                        record_cpu_time);
             } else {
             }
         }
@@ -1326,7 +1318,6 @@ Init_vernier(void)
     sym_state = sym("state");
     sym_gc_by = sym("gc_by");
     sym_fiber_id = sym("fiber_id");
-    sym_cpu_time = sym("cpu_time");
     rb_gc_latest_gc_info(sym_state); // HACK: needs to be warmed so that it can be called during GC
 
   rb_mVernier = rb_define_module("Vernier");
